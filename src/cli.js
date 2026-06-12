@@ -49,6 +49,8 @@ async function run() {
 }
 
 // Only auto-run as a real CLI, not when imported by tests.
-if (process.argv[1] && process.argv[1].endsWith('cli.js')) {
+// Source entry is cli.js; the ncc bundle is emitted as index.js, so match both.
+const entry = process.argv[1] || ''
+if (entry.endsWith('cli.js') || entry.endsWith('dist-cli/index.js') || entry.endsWith('dist-cli\\index.js')) {
   run().catch((e) => { console.error(`naoru: ${e.message}`) }) // fail-safe, exit 0
 }
