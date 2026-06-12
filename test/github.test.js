@@ -4,11 +4,12 @@ import { MARKER } from '../src/parse.js'
 
 describe('tailAndClean', () => {
   it('strips ANSI and tails to N lines', () => {
-    const raw = Array.from({ length: 10 }, (_, i) => `[31mline${i}[0m`).join('\n')
+    const raw = Array.from({ length: 10 }, (_, i) => `\x1b[31mline${i}\x1b[0m`).join('\n')
     const out = tailAndClean(raw, 3)
     expect(out.split('\n')).toHaveLength(3)
     expect(out).toContain('line9')
-    expect(out).not.toContain('[31m')
+    expect(out).not.toContain('\x1b')
+    expect(out).not.toContain('[31m')
   })
 })
 

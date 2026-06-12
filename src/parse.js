@@ -8,7 +8,7 @@ export function normalize(raw) {
     rootCause: String(raw?.rootCause || 'Unknown').trim(),
     suggestedFix: String(raw?.suggestedFix || 'No fix suggested.').trim(),
     confidence: LEVELS.includes(conf) ? conf : 'low',
-    files: Array.isArray(raw?.files) ? raw.files.map(String) : [],
+    files: Array.isArray(raw?.files) ? raw.files.filter(Boolean).map(String) : [],
   }
 }
 

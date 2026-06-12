@@ -1,6 +1,6 @@
 import { MARKER } from './parse.js'
 
-const ANSI = /\[[0-9;]*m/g
+const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g
 
 export function tailAndClean(text, maxLines) {
   const clean = String(text || '').replace(ANSI, '')
