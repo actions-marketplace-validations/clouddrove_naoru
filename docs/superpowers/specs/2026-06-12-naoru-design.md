@@ -21,7 +21,7 @@ Tagline: *"Heal your broken CI with AI — naoru diagnoses why your pipeline fai
 
 - Cut time-to-diagnosis on failed CI runs.
 - Zero backend / zero hosting for adopters — runs inside their own CI.
-- Bring-your-own `ANTHROPIC_API_KEY`. No secret custody by us.
+- Bring-your-own LLM key (Anthropic, OpenAI, OpenRouter, xAI/Grok, Groq, any OpenAI-compatible). No secret custody by us.
 - Clean GitHub Marketplace listing — public product front door.
 
 ## Non-Goals (v1)
@@ -29,6 +29,7 @@ Tagline: *"Heal your broken CI with AI — naoru diagnoses why your pipeline fai
 - Auto-fix commits or fix PRs.
 - Re-running / merging pipelines.
 - Multi-platform (GitLab, Jenkins) — GitHub Actions only.
+- Provider abstraction is in v1 (Anthropic + OpenAI-compatible covers OpenAI/OpenRouter/xAI/Groq). Bespoke non-OpenAI-compatible SDKs (e.g. Gemini native) deferred — reachable via OpenRouter meanwhile.
 - Central dashboard, cross-repo learning, billing. (Future GitHub App phase.)
 
 ## Architecture
@@ -57,8 +58,12 @@ naoru/
 ├── src/
 │   ├── index.js            # entry: orchestrates the flow
 │   ├── github.js           # fetch logs, fetch PR diff, upsert comment
-│   ├── claude.js           # Anthropic SDK call + prompt construction
-│   └── parse.js            # structured tool-call output → comment markdown
+│   ├── prompt.js           # build prompt + JSON schema (provider-agnostic)
+│   ├── providers/
+│   │   ├── index.js        # resolve provider from input → client
+│   │   ├── anthropic.js    # Anthropic SDK, tool-call structured output
+│   │   └── openai.js       # OpenAI SDK + base-url (openai/openrouter/xai/groq/...)
+│   └── parse.js            # normalize structured output → comment markdown
 ├── dist/                   # ncc-bundled output (committed)
 ├── .github/
 │   └── workflows/
@@ -75,16 +80,19 @@ naoru/
 - Node 20
 - `@actions/core` — inputs, outputs, annotations
 - `@actions/github` — Octokit client, context
-- `@anthropic-ai/sdk` — Claude calls
+- `@anthropic-ai/sdk` — native Anthropic calls
+- `openai` — OpenAI SDK, also drives OpenRouter / xAI (Grok) / Groq / any OpenAI-compatible endpoint via `base-url`
 - `@vercel/ncc` — bundle to single `dist/index.js`
 
 ## Inputs
 
 | input | required | default | notes |
 |---|---|---|---|
-| `anthropic-api-key` | yes | — | team's own key, stored as repo secret |
+| `api-key` | yes | — | LLM key, stored as repo secret |
+| `provider` | no | `anthropic` | `anthropic` \| `openai` \| `openrouter` \| `xai` \| `groq` \| `custom` |
+| `base-url` | no | (per-provider) | override endpoint; required when `provider: custom` |
+| `model` | no | (per-provider default) | e.g. `claude-sonnet-4-6`, `gpt-4o`, `grok-2`, `x-ai/grok-2` (openrouter) |
 | `github-token` | no | `${{ github.token }}` | needs `pull-requests: write`, `actions: read` |
-| `model` | no | `claude-sonnet-4-6` | default cheap; opt into `claude-opus-4-8` |
 | `max-log-lines` | no | `500` | tail N lines of log for token control |
 | `failed-job-name` | no | (auto-detect) | optional explicit job to diagnose |
 
@@ -96,11 +104,21 @@ naoru/
 | `confidence` | `high` / `medium` / `low` |
 | `comment-url` | URL of posted/updated comment |
 
-## Claude Integration
+## LLM Integration (multi-provider)
 
-- **Structured output:** force a tool-call with JSON schema — `{ rootCause, suggestedFix, confidence, files[] }`. Reliable parse, no regex on prose.
-- **Prompt contents:** failed job name, tailed+ANSI-stripped logs, PR diff, changed file list.
-- **Model default:** `claude-sonnet-4-6` for cost; `claude-opus-4-8` opt-in via `model` input.
+- **Provider abstraction:** `src/providers/index.js` resolves the `provider` input to a client exposing one method: `diagnose(prompt, schema) → { rootCause, suggestedFix, confidence, files[] }`.
+  - `anthropic.js` — native Anthropic SDK, structured output via tool-call.
+  - `openai.js` — OpenAI SDK; structured output via function/tool-call or `response_format: json_schema`. One client serves all OpenAI-compatible endpoints by swapping `base-url`:
+    | provider | base-url | example model |
+    |---|---|---|
+    | `openai` | `https://api.openai.com/v1` | `gpt-4o` |
+    | `openrouter` | `https://openrouter.ai/api/v1` | `x-ai/grok-2`, `anthropic/claude-3.5-sonnet` |
+    | `xai` | `https://api.x.ai/v1` | `grok-2` |
+    | `groq` | `https://api.groq.com/openai/v1` | `llama-3.3-70b` |
+    | `custom` | user-supplied | any |
+- **Structured output:** JSON schema `{ rootCause, suggestedFix, confidence, files[] }`. Reliable parse, no regex on prose. `parse.js` normalizes both provider shapes to the same object.
+- **Prompt contents:** failed job name, tailed+ANSI-stripped logs, PR diff, changed file list. Prompt is provider-agnostic (`prompt.js`).
+- **Per-provider default model:** sane cheap default per provider when `model` omitted.
 
 ## Comment Behavior
 
@@ -129,10 +147,26 @@ naoru/
 - **Cost guard** — sonnet default, opus opt-in.
 - **Fail-safe** — naoru never fails the build; diagnosis is additive.
 
-## Testing
+## Testing & CI
 
-- **Unit:** `parse.js` (tool-call JSON → markdown), `github.js` log tailing / ANSI strip / marker detection (mocked Octokit).
-- **Dogfood:** `.github/workflows/self-test.yml` runs an intentionally-failing job, then naoru, and asserts a comment was posted on the PR.
+Test runner: **Vitest** (Node 20).
+
+- **Unit:**
+  - `parse.js` — both provider output shapes → normalized object → markdown.
+  - `github.js` — log tailing, ANSI strip, sticky-marker detect/upsert (mocked Octokit).
+  - `providers/index.js` — provider resolution, base-url defaults, `custom` validation.
+  - `providers/*.js` — request shape + response normalization (mocked SDK / `fetch`, no real API calls).
+- **Dogfood (`self-test.yml`):** intentionally-failing job → naoru job → assert sticky comment posted. Runs only when an LLM key secret is present (skips on forks).
+
+### `.github/workflows/` (CI for the repo itself)
+
+| workflow | trigger | does |
+|---|---|---|
+| `ci.yml` | push, PR | `npm ci`, lint, `vitest run`, **`dist` freshness check** (rebuild `ncc`, fail if `dist/` differs from committed) |
+| `self-test.yml` | PR (key present) | live dogfood end-to-end |
+| `release.yml` | tag `v*` | build `dist/`, GitHub Release, move major tag `v1` |
+
+`dist` freshness check is critical — Actions run committed `dist/`, so stale bundle = silently wrong behavior.
 
 ## Release
 
