@@ -1,4 +1,4 @@
-name: 'naoru'
+name: 'naoru - AI CI Doctor'
 description: 'Heal your broken CI with AI — diagnoses why your pipeline failed and comments the fix on your PR.'
 branding:
   icon: 'activity'
