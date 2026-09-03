@@ -3,21 +3,39 @@
 export const FIX_BRANCH_PREFIX = 'naoru/fix-'
 export const FIX_LABEL = 'naoru-fix'
 
-// Workflow files are attacker-reachable via log content (prompt injection);
-// never let a generated diff touch them.
-const PROTECTED_PATH = /^\.github\//
+// Log content is attacker-reachable (a dependency or test can print anything),
+// so a generated diff has to be treated as untrusted input. Opening a fix PR
+// makes CI run whatever is on that branch, so the block list covers files that
+// execute during checkout, install, or build — not just workflow definitions.
+//
+// package.json is deliberately NOT here: a dependency-version fix is one of the
+// most common legitimate repairs, and its `scripts` risk still needs a human to
+// open the PR. Add it via `protected-paths` if that trade isn't right for you.
+const PROTECTED_PATH = /^\.github\/|(^|\/)(\.npmrc|\.yarnrc(\.yml)?|\.pnpmfile\.cjs|Dockerfile[^/]*|Makefile|\.gitattributes|\.git-blame-ignore-revs)$|\.(sh|bash|zsh|ps1|bat|cmd)$/i
 
 // Parse a unified diff into per-file hunks. Tolerates model sloppiness:
-// missing `diff --git` headers, `a/`/`b/` prefixes optional, prose between files.
+// `diff --git` headers with no `---`/`+++` lines, `a/`/`b/` prefixes optional,
+// prose between files.
 export function parseDiff(text) {
   const files = []
   let file = null
   let hunk = null
   for (const line of String(text || '').split('\n')) {
-    if (line.startsWith('+++ ')) {
+    const git = /^diff --git (?:a\/)?\S+ (?:b\/)?(\S+)/.exec(line)
+    if (git) {
+      file = { path: git[1], hunks: [], fromGitHeader: true }
+      files.push(file)
+      hunk = null
+    } else if (line.startsWith('+++ ')) {
       const p = line.slice(4).trim().replace(/^b\//, '')
-      file = p && p !== '/dev/null' ? { path: p, hunks: [] } : null
-      if (file) files.push(file)
+      if (file?.fromGitHeader && !file.hunks.length) {
+        // `+++` following a `diff --git` header names the same file; it wins.
+        if (p && p !== '/dev/null') file.path = p
+        else { files.pop(); file = null }
+      } else {
+        file = p && p !== '/dev/null' ? { path: p, hunks: [] } : null
+        if (file) files.push(file)
+      }
       hunk = null
     } else if (line.startsWith('--- ')) {
       hunk = null
@@ -79,19 +97,34 @@ export function locateHunk(lines, hunk) {
 
 // Apply every hunk to `content`. Throws if any hunk can't be placed uniquely.
 export function applyHunks(content, hunks) {
-  let lines = String(content).split('\n')
-  for (const hunk of hunks) {
+  const { content: out, failed } = applyHunksPartial(content, hunks)
+  if (failed.length) throw new Error('hunk context not found (or ambiguous) in file')
+  return out
+}
+
+// Apply what can be applied; report which hunks (1-based) could not be placed.
+export function applyHunksPartial(content, hunks) {
+  const lines = String(content).split('\n')
+  const failed = []
+  let applied = 0
+  hunks.forEach((hunk, i) => {
     const loc = locateHunk(lines, hunk)
-    if (!loc) throw new Error('hunk context not found (or ambiguous) in file')
+    if (!loc) {
+      failed.push(i + 1)
+      return
+    }
     lines.splice(loc.index, loc.oldLines.length, ...loc.newLines)
-  }
-  return lines.join('\n')
+    applied++
+  })
+  return { content: lines.join('\n'), applied, failed }
 }
 
 // Sanity-gate a parsed diff before acting on it. Returns an error string or null.
-export function validateFix(files, { maxChangedLines = 300 } = {}) {
+export function validateFix(files, { maxChangedLines = 300, extraProtected = [] } = {}) {
   if (!files.length) return 'no parsable file changes in the diagnosed diff'
-  const bad = files.find((f) => PROTECTED_PATH.test(f.path) || f.path.includes('..'))
+  const blocked = (p) =>
+    PROTECTED_PATH.test(p) || p.includes('..') || p.startsWith('/') || extraProtected.some((re) => re.test(p))
+  const bad = files.find((f) => blocked(f.path))
   if (bad) return `refusing to modify protected path: ${bad.path}`
   const changed = files.reduce(
     (n, f) => n + f.hunks.reduce((m, h) => m + h.lines.filter((l) => l.op !== ' ').length, 0),
@@ -154,9 +187,28 @@ export async function postSuggestions(octokit, { owner, repo, prNumber, headSha,
 // the failing branch itself.
 export async function openFixPr(octokit, { owner, repo, prNumber, runId, headRef, headSha, files, diagnosis, warn = () => {} }) {
   const updated = []
+  const dropped = []
   for (const file of files) {
-    const text = await getFileText(octokit, { owner, repo, path: file.path, ref: headSha })
-    updated.push({ path: file.path, content: applyHunks(text, file.hunks) })
+    let text
+    try {
+      text = await getFileText(octokit, { owner, repo, path: file.path, ref: headSha })
+    } catch (e) {
+      warn(`naoru fix: cannot read ${file.path}: ${e.message}`)
+      dropped.push(file.path)
+      continue
+    }
+    const { content, applied, failed } = applyHunksPartial(text, file.hunks)
+    if (failed.length) {
+      warn(`naoru fix: ${file.path}: could not locate hunk(s) ${failed.join(', ')} on the PR head; ${applied ? 'applying the rest' : 'skipping this file'}`)
+    }
+    if (!applied) {
+      dropped.push(file.path)
+      continue
+    }
+    updated.push({ path: file.path, content })
+  }
+  if (!updated.length) {
+    throw new Error(`no hunk of the diagnosed diff could be applied to the PR head (files tried: ${files.map((f) => f.path).join(', ')})`)
   }
 
   const { data: headCommit } = await octokit.rest.git.getCommit({ owner, repo, commit_sha: headSha })
@@ -186,6 +238,9 @@ export async function openFixPr(octokit, { owner, repo, prNumber, runId, headRef
       '',
       `**Suggested fix:**`,
       diagnosis.suggestedFix,
+      ...(dropped.length
+        ? ['', `> [!WARNING]`, `> Parts of the diagnosed diff could not be applied and were skipped: ${dropped.join(', ')}. See the diagnosis comment for the full diff.`]
+        : []),
       '',
       'Review carefully before merging — this patch was machine-generated from the failure diagnosis.',
     ].join('\n'),

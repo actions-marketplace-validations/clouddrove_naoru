@@ -1,6 +1,6 @@
 {
   "name": "naoru",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Heal your broken CI with AI — diagnoses why your pipeline failed and comments the fix on your PR.",
   "license": "Apache-2.0",
   "type": "module",
@@ -16,13 +16,13 @@
   "dependencies": {
     "@actions/core": "^3.0.1",
     "@actions/github": "^9.1.1",
-    "@anthropic-ai/sdk": "^0.105.0",
-    "openai": "^6.44.0"
+    "@anthropic-ai/sdk": "^0.115.0",
+    "openai": "^6.49.0"
   },
   "devDependencies": {
-    "@vercel/ncc": "^0.44.0",
-    "eslint": "^10.5.0",
-    "globals": "^17.6.0",
-    "vitest": "^4.1.9"
+    "@vercel/ncc": "^0.44.1",
+    "eslint": "^10.7.0",
+    "globals": "^17.7.0",
+    "vitest": "^4.1.10"
   }
 }

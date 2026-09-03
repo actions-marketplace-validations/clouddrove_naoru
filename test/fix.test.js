@@ -1,9 +1,9 @@
 import { describe, it, expect, vi } from 'vitest'
-import { parseDiff, applyHunks, locateHunk, validateFix, postSuggestions, openFixPr } from '../src/fix.js'
+import { parseDiff, applyHunks, applyHunksPartial, locateHunk, validateFix, postSuggestions, openFixPr } from '../src/fix.js'
 
 const DIFF = [
-  '--- a/Dockerfile',
-  '+++ b/Dockerfile',
+  '--- a/src/app.js',
+  '+++ b/src/app.js',
   '@@ -1,4 +1,3 @@',
   ' WORKDIR /app',
   ' COPY . .',
@@ -15,7 +15,7 @@ describe('parseDiff', () => {
   it('parses files and hunks, stripping a/b prefixes', () => {
     const files = parseDiff(DIFF)
     expect(files).toHaveLength(1)
-    expect(files[0].path).toBe('Dockerfile')
+    expect(files[0].path).toBe('src/app.js')
     expect(files[0].hunks[0].lines.filter((l) => l.op === '-')).toHaveLength(1)
   })
   it('tolerates prose around the diff and missing diff --git headers', () => {
@@ -25,6 +25,23 @@ describe('parseDiff', () => {
   it('drops files with no actual changes and returns [] for garbage', () => {
     expect(parseDiff('not a diff at all')).toEqual([])
     expect(parseDiff('')).toEqual([])
+  })
+  it('parses a diff --git header with no ---/+++ lines', () => {
+    const files = parseDiff([
+      'diff --git a/src/app.js b/src/app.js',
+      '@@ -1,2 +1,1 @@',
+      ' WORKDIR /app',
+      '-COPY missing-file.txt /app/',
+    ].join('\n'))
+    expect(files).toHaveLength(1)
+    expect(files[0].path).toBe('src/app.js')
+    expect(files[0].hunks).toHaveLength(1)
+  })
+  it('does not duplicate a file when diff --git is followed by ---/+++ headers', () => {
+    const files = parseDiff(`diff --git a/src/app.js b/src/app.js\n${DIFF}`)
+    expect(files).toHaveLength(1)
+    expect(files[0].path).toBe('src/app.js')
+    expect(files[0].hunks).toHaveLength(1)
   })
 })
 
@@ -55,6 +72,14 @@ describe('applyHunks / locateHunk', () => {
     expect(loc).not.toBeNull()
     expect(loc.index).toBe(1)
   })
+  it('applyHunksPartial applies locatable hunks and reports the rest', () => {
+    const [file] = parseDiff(DIFF)
+    const bogus = { lines: [{ op: '-', text: 'line that does not exist' }, { op: '+', text: 'replacement' }] }
+    const { content: out, applied, failed } = applyHunksPartial(content, [...file.hunks, bogus])
+    expect(out).toBe('WORKDIR /app\nCOPY . .\nCMD ["node", "app.js"]')
+    expect(applied).toBe(1)
+    expect(failed).toEqual([2])
+  })
   it('falls back to removed-lines-only when model context is invented', () => {
     const hunk = {
       lines: [
@@ -73,12 +98,36 @@ describe('applyHunks / locateHunk', () => {
 })
 
 describe('validateFix', () => {
+  const forPath = (p) => parseDiff(`--- a/${p}\n+++ b/${p}\n@@\n-a\n+b`)
+
   it('rejects empty, protected paths, traversal, and oversized diffs', () => {
     expect(validateFix([])).toMatch(/no parsable/)
-    expect(validateFix(parseDiff('--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@\n-a\n+b'))).toMatch(/protected/)
+    expect(validateFix(forPath('.github/workflows/ci.yml'))).toMatch(/protected/)
     const big = parseDiff(DIFF)
     expect(validateFix(big, { maxChangedLines: 0 })).toMatch(/too large/)
     expect(validateFix(big)).toBeNull()
+  })
+
+  // Opening a fix PR makes CI execute the branch, so anything that runs during
+  // checkout/install/build is off limits to a model-generated diff.
+  it('rejects files that execute during checkout, install, or build', () => {
+    for (const p of ['Dockerfile', 'docker/Dockerfile.prod', 'Makefile', '.npmrc', '.yarnrc.yml', 'scripts/deploy.sh', 'tools/run.ps1']) {
+      expect(validateFix(forPath(p)), p).toMatch(/protected/)
+    }
+  })
+
+  it('rejects traversal and absolute paths', () => {
+    expect(validateFix(forPath('../../etc/passwd'))).toMatch(/protected/)
+    expect(validateFix(forPath('/etc/passwd'))).toMatch(/protected/)
+  })
+
+  it('still allows ordinary source and manifest fixes', () => {
+    expect(validateFix(forPath('src/auth.ts'))).toBeNull()
+    expect(validateFix(forPath('package.json'))).toBeNull()
+  })
+
+  it('honors caller-supplied protected patterns', () => {
+    expect(validateFix(forPath('package.json'), { extraProtected: [/^package\.json$/] })).toMatch(/protected/)
   })
 })
 
@@ -115,7 +164,7 @@ describe('postSuggestions', () => {
     })
     expect(posted).toBe(1)
     const call = octokit.rest.pulls.createReviewComment.mock.calls[0][0]
-    expect(call.path).toBe('Dockerfile')
+    expect(call.path).toBe('src/app.js')
     expect(call.start_line).toBe(1)
     expect(call.line).toBe(4)
     expect(call.body).toContain('```suggestion')
@@ -147,5 +196,46 @@ describe('openFixPr', () => {
     expect(pr.base).toBe('feature-x')
     expect(pr.head).toBe('naoru/fix-42')
     expect(octokit.rest.issues.addLabels).toHaveBeenCalled()
+  })
+  it('opens a partial PR when only some hunks apply, warning about the rest', async () => {
+    const octokit = mockOctokit(content)
+    const warn = vi.fn()
+    const files = parseDiff(DIFF)
+    files[0].hunks.push({ lines: [{ op: '-', text: 'nonexistent line' }, { op: '+', text: 'x' }] })
+    const url = await openFixPr(octokit, {
+      owner: 'o', repo: 'r', prNumber: 1, runId: 42, headRef: 'feature-x', headSha: 'h',
+      files, warn,
+      diagnosis: { rootCause: 'missing file', suggestedFix: 'remove the COPY line' },
+    })
+    expect(url).toBe('https://x/pr/9')
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('could not locate hunk(s) 2'))
+    const tree = octokit.rest.git.createTree.mock.calls[0][0]
+    expect(tree.tree[0].content).toBe('WORKDIR /app\nCOPY . .\nCMD ["node", "app.js"]')
+  })
+  it('throws when no hunk in any file can be applied', async () => {
+    const octokit = mockOctokit('completely unrelated content')
+    const warn = vi.fn()
+    await expect(openFixPr(octokit, {
+      owner: 'o', repo: 'r', prNumber: 1, runId: 42, headRef: 'feature-x', headSha: 'h',
+      files: parseDiff(DIFF), warn,
+      diagnosis: { rootCause: 'x', suggestedFix: 'y' },
+    })).rejects.toThrow(/no hunk of the diagnosed diff could be applied/)
+    expect(octokit.rest.pulls.create).not.toHaveBeenCalled()
+  })
+  it('skips unreadable files but still fixes readable ones', async () => {
+    const octokit = mockOctokit(content)
+    octokit.rest.repos.getContent
+      .mockRejectedValueOnce(new Error('404'))
+      .mockResolvedValueOnce({ data: { type: 'file', content: Buffer.from(content).toString('base64') } })
+    const warn = vi.fn()
+    const files = parseDiff(`--- a/Missing\n+++ b/Missing\n@@\n-gone\n+here\n${DIFF}`)
+    const url = await openFixPr(octokit, {
+      owner: 'o', repo: 'r', prNumber: 1, runId: 42, headRef: 'feature-x', headSha: 'h',
+      files, warn,
+      diagnosis: { rootCause: 'x', suggestedFix: 'y' },
+    })
+    expect(url).toBe('https://x/pr/9')
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('cannot read Missing'))
+    expect(octokit.rest.pulls.create.mock.calls[0][0].body).toContain('could not be applied')
   })
 })
